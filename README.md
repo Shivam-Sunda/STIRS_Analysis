@@ -61,4 +61,4 @@ jupyter notebook
 ---
 
 ## 🤝 Contributions
-Feel free to fork this repository, raise issues, or submit pull requests!
+Feel free to fork this repository, raise issues, or submit pull requests
