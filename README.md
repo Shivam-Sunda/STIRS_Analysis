@@ -6,7 +6,7 @@ This project explores the relationship between the **Effective Federal Funds Rat
 ---
 
 ## 📂 Dataset
-- **Time Period:** January 2025 –February 2026  
+- **Time Period:** January 2025 – February 2026  
 - **Total Changes in 75th Percentile:** 54  
   - 26 downward movements  
   - 28 upward movements  
