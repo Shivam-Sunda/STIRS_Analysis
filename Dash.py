@@ -438,24 +438,57 @@ def sofr_fixing_chart(cases_results: dict,
     return chart
 
 
-def gc_chart(gc_df: pd.DataFrame) -> alt.Chart | None:
-    """Separate GC Repo chart with auto y-axis."""
-    if gc_df.empty:
+def gc_chart(gc_df: pd.DataFrame, actual_df: pd.DataFrame) -> alt.Chart | None:
+    """GC Repo + SOFR Actual chart with auto y-axis."""
+    if gc_df.empty and actual_df.empty:
         return None
-    df = gc_df.copy()
-    df["date"] = pd.to_datetime(df["date"])
-    chart = (alt.Chart(df)
-             .mark_line(color="#a78bfa", point=False)
-             .encode(
-                 x=alt.X("date:T", title="Date"),
-                 y=alt.Y("gc:Q", title="GC Rate (%)",
-                         scale=alt.Scale(zero=False)),
-                 tooltip=["date:T", alt.Tooltip("gc:Q", format=".5f")],
-             )
-             .properties(height=200)
-             .configure_view(fill="#0d0f14")
-             .configure_axis(gridColor="#1e2436", labelColor="#94a3b8", titleColor="#64748b")
-             .interactive())
+
+    records = []
+
+    # GC data
+    if not gc_df.empty:
+        df_gc = gc_df.copy()
+        df_gc["date"] = pd.to_datetime(df_gc["date"])
+        for _, row in df_gc.iterrows():
+            records.append({
+                "date": row["date"],
+                "rate": row["gc"],
+                "series": "GC Repo"
+            })
+
+    # SOFR actual data
+    if not actual_df.empty:
+        df_sofr = actual_df.copy()
+        df_sofr["date"] = pd.to_datetime(df_sofr["date"])
+        for _, row in df_sofr.iterrows():
+            records.append({
+                "date": row["date"],
+                "rate": row["rate"],
+                "series": "SOFR Actual"
+            })
+
+    df = pd.DataFrame(records)
+
+    chart = (
+        alt.Chart(df)
+        .mark_line(point=False)
+        .encode(
+            x=alt.X("date:T", title="Date"),
+            y=alt.Y("rate:Q", title="Rate (%)", scale=alt.Scale(zero=False)),
+            color=alt.Color("series:N", title=""),
+            tooltip=["date:T", "series:N", alt.Tooltip("rate:Q", format=".5f")],
+        )
+        .properties(height=220)
+        .configure_view(fill="#0d0f14")
+        .configure_axis(
+            gridColor="#1e2436",
+            labelColor="#94a3b8",
+            titleColor="#64748b"
+        )
+        .configure_legend(labelColor="#c9d1e0")
+        .interactive()
+    )
+
     return chart
 
 
@@ -629,15 +662,15 @@ with st.sidebar:
 
     st.markdown("---")
     st.markdown("### 📐 Forward Avg Estimator")
-    fwd_avg = st.number_input("Avg SOFR for remaining days (%)", value=5.30,
-                               step=0.01, format="%.4f",
+    fwd_avg = st.number_input("Avg SOFR for remaining days (%)", value=3.64,
+                               step=0.01, format="%.2f",
                                help="Applied to unfilled future days for estimated fixing & price")
 
     st.markdown("---")
     st.markdown("### ⚡ Fast Fill")
     ff_contract = st.selectbox("Contract", ["SR1", "SR3"])
     ff_case     = st.selectbox("Case", CASES)
-    ff_val      = st.number_input("Rate (%)", value=5.30, step=0.01, format="%.4f")
+    ff_val      = st.number_input("Rate (%)", value=3.64, step=0.01, format="%.2f")
     if st.button("Apply to all remaining days"):
         ck = ff_contract.lower()
         s  = (date(sel_year, sel_month, 1) if ck == "sr1"
@@ -656,7 +689,7 @@ with st.sidebar:
     st.markdown("### ↕ Shift Case")
     sh_contract = st.selectbox("Contract ", ["SR1", "SR3"], key="sh_con")
     sh_case     = st.selectbox("Case ", CASES, key="sh_case")
-    sh_bps      = st.number_input("Shift (bps)", value=0.0, step=0.5, format="%.1f")
+    sh_bps      = st.number_input("Shift (bps)", value=0, step=1)
     if st.button("Apply shift"):
         ck = sh_contract.lower()
         for iso_str, val in list(state[ck][sh_case].items()):
@@ -668,10 +701,10 @@ with st.sidebar:
 
     st.markdown("---")
     st.markdown("### 📊 Position")
-    sr1_lots  = st.number_input("SR1 Lots",        value=10,    step=1)
-    sr3_lots  = st.number_input("SR3 Lots",        value=5,     step=1)
-    sr1_entry = st.number_input("SR1 Entry Price", value=94.50, step=0.01, format="%.4f")
-    sr3_entry = st.number_input("SR3 Entry Price", value=94.75, step=0.01, format="%.4f")
+    sr1_lots  = st.number_input("SR1 Lots",        value=1,    step=1)
+    sr3_lots  = st.number_input("SR3 Lots",        value=1,     step=1)
+    sr1_entry = st.number_input("SR1 Entry Price", value=96.36, step=0.0025, format="%.4f")
+    sr3_entry = st.number_input("SR3 Entry Price", value=96.36, step=0.0025, format="%.4f")
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # CONTRACT WINDOWS
@@ -771,9 +804,9 @@ def render_table(contract: str, start: date, end_excl: date, key: str) -> pd.Dat
         "Date":        st.column_config.DateColumn("Date",          disabled=True),
         "Day":         st.column_config.TextColumn("Day",           disabled=True, width="small"),
         "Days":        st.column_config.NumberColumn("Days",        disabled=True, width="small"),
-        "Actual SOFR": st.column_config.NumberColumn("Actual (%)",  disabled=True, format="%.5f"),
-        "GC Repo":     st.column_config.NumberColumn("GC Repo (%)", disabled=True, format="%.5f"),
-        "ICAP":        st.column_config.NumberColumn("ICAP (%)",    disabled=True, format="%.5f"),
+        "Actual SOFR": st.column_config.NumberColumn("Actual (%)",  disabled=True, format="%.2f"),
+        "GC Repo":     st.column_config.NumberColumn("GC Repo (%)", disabled=True, format="%.2f"),
+        "ICAP":        st.column_config.NumberColumn("ICAP (%)",    disabled=True, format="%.2f"),
     }
 
     # Determine which rows are locked (past) vs editable (future/today)
@@ -796,14 +829,14 @@ def render_table(contract: str, start: date, end_excl: date, key: str) -> pd.Dat
     if all_locked:
         # Fully disable case columns and notes
         for c in CASES:
-            col_cfg[c] = st.column_config.NumberColumn(c, disabled=True, format="%.4f")
+            col_cfg[c] = st.column_config.NumberColumn(c, disabled=True, format="%.2f")
         col_cfg["Notes"] = st.column_config.TextColumn("Notes", disabled=True)
     else:
         # Future case columns are editable; past rows will have their values
         # preserved from actual/state and won't be saved back even if touched
         for c in CASES:
             col_cfg[c] = st.column_config.NumberColumn(
-                c, format="%.4f", min_value=0.0, max_value=20.0)
+                c, format="%.2f", min_value=0.0, max_value=20.0)
         col_cfg["Notes"] = st.column_config.TextColumn("Notes")
 
     # ── Single data_editor ────────────────────────────────────────────────────
@@ -885,7 +918,7 @@ def render_past_month(contract_label: str, start: date, end_excl: date,
             compute_fn(sel_year, sel_month, actual_window, 0.0),
             rounding_contract)
         st.markdown(
-            settle_card(contract_label, f"{res['price']:.4f}", f"{res['rate']:.5f}%"),
+            settle_card(contract_label, f"{res['price']:.3f}", f"{res['rate']:.3f}%"),
             unsafe_allow_html=True)
 
     ch = past_month_actual_chart(actual_df, start, end_excl)
@@ -952,8 +985,8 @@ with tab_sr1:
             with cards[i]:
                 if res:
                     extra = "icap-card" if col_key == "ICAP" else ""
-                    st.markdown(price_card(col_key, f"{res['price']:.4f}",
-                                          f"{res['rate']:.5f}%",
+                    st.markdown(price_card(col_key, f"{res['price']:.3f}",
+                                          f"{res['rate']:.3f}%",
                                           extra_cls=extra, hl=(col_key == "Case1")),
                                 unsafe_allow_html=True)
                 else:
@@ -966,7 +999,7 @@ with tab_sr1:
 
         if has_gc:
             section("GC Repo Rate")
-            gc_ch = gc_chart(gc_df)
+            gc_ch = gc_chart(gc_df, actual_df)
             if gc_ch:
                 st.altair_chart(gc_ch, use_container_width=True)
 
@@ -1015,7 +1048,7 @@ with tab_sr3:
                 if res:
                     extra = "icap-card" if col_key == "ICAP" else ""
                     st.markdown(price_card(col_key, f"{res['price']:.4f}",
-                                          f"{res['rate']:.5f}%",
+                                          f"{res['rate']:.4f}%",
                                           extra_cls=extra, hl=(col_key == "Case1")),
                                 unsafe_allow_html=True)
                 else:
@@ -1028,7 +1061,7 @@ with tab_sr3:
 
         if has_gc:
             section("GC Repo Rate")
-            gc_ch = gc_chart(gc_df)
+            gc_ch = gc_chart(gc_df, actual_df)
             if gc_ch:
                 st.altair_chart(gc_ch, use_container_width=True)
 
