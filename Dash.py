@@ -1,8 +1,15 @@
 """
-SOFR SR1 / SR3 Dashboard  –  v6
+SOFR SR1 / SR3 Dashboard  –  v8
 Run:  streamlit run sofr_dashboard.py
 Excel:  date | sofr | icap | gc   (icap and gc optional)
 State:  sofr_state.json  (auto-created alongside script)
+
+Weekend handling: Excel contains ONLY business days. day_count for each
+business day is computed as the calendar gap to the NEXT business day
+(not hardcoded Friday=3). This correctly absorbs any weekend or holiday
+gap — including month-start weekends such as March 1 (Sun) being carried
+by Feb 27 (Fri) with day_count=3. No weekend rows are ever displayed.
+SR3 compounding uses factor = 1 + (r/100) * (day_count/360).
 """
 
 import streamlit as st
@@ -58,6 +65,7 @@ def get_third_tuesday(year: int, month: int) -> date:
 
 
 def business_days(start: date, end_excl: date) -> list[date]:
+    """Return only Mon–Fri dates in [start, end_excl). Weekends are never included."""
     out, d = [], start
     while d < end_excl:
         if d.weekday() < 5:
@@ -66,17 +74,50 @@ def business_days(start: date, end_excl: date) -> list[date]:
     return out
 
 
-def day_count_for(d: date) -> int:
-    return 3 if d.weekday() == 4 else 1
+def calendar_gap_day_count(bd: date, next_bd) -> int:
+    """
+    Return the number of calendar days this business day represents.
+    Computed as (next_business_day - current_business_day).days so that
+    any weekend or holiday gap between two consecutive business days is
+    automatically absorbed into the earlier day.
+
+    Examples:
+      Mon -> Tue  : gap = 1
+      Fri -> Mon  : gap = 3  (Fri + Sat + Sun)
+      Thu -> Mon  : gap = 4  (Thu + Fri + Sat + Sun, e.g. Easter Fri holiday)
+      last day    : gap = 1  (fallback)
+
+    This replaces the old hardcoded Friday=3 logic and correctly handles
+    month-start weekends: Feb 27 (Fri) -> Mar 2 (Mon) gives day_count=3,
+    so March 1 (Sun) is included in Feb 27's accrual.
+    """
+    if next_bd is None:
+        return 1
+    return (next_bd - bd).days
 
 
 def build_rate_series(start: date, end_excl: date,
                       actual_df: pd.DataFrame, forward_rate: float) -> pd.DataFrame:
+    """
+    Build business-day-only rate series with calendar-gap day counts.
+
+    Algorithm:
+      1. Enumerate all business days in [start, end_excl).
+      2. For each business day i:
+           day_count = next_business_day[i] - business_day[i]  (calendar days)
+         The last business day uses day_count = 1 (fallback).
+      3. This ensures every calendar day -- including weekends/holidays
+         between consecutive business days, or a month starting on a
+         weekend (e.g. March 1 Sun) -- is counted via the preceding
+         business day's day_count. No Saturday/Sunday rows are created.
+    """
     lookup = actual_df.set_index("date")["rate"].to_dict()
-    rows = []
-    for d in business_days(start, end_excl):
-        dc  = day_count_for(d)
-        src = "actual" if d in lookup else "forward"
+    bds    = business_days(start, end_excl)
+    rows   = []
+    for i, d in enumerate(bds):
+        next_bd = bds[i + 1] if i + 1 < len(bds) else None
+        dc      = calendar_gap_day_count(d, next_bd)
+        src     = "actual" if d in lookup else "forward"
         rows.append({"date": d, "rate": lookup.get(d, forward_rate),
                      "source": src, "day_count": dc})
     return pd.DataFrame(rows)
@@ -84,10 +125,57 @@ def build_rate_series(start: date, end_excl: date,
 
 def compute_sr1(year: int, month: int,
                 actual_df: pd.DataFrame, forward_rate: float) -> dict:
-    """Unchanged structure. Rounding applied externally via apply_rounding()."""
-    start  = date(year, month, 1)
-    end    = date(year, month, calendar.monthrange(year, month)[1]) + timedelta(days=1)
-    series = build_rate_series(start, end, actual_df, forward_rate)
+    """
+    SR1: simple average of SOFR over ALL calendar days in the month.
+
+    Algorithm:
+      1. Build a row for every calendar day from the 1st to the last of the
+         month (inclusive).
+      2. Known actuals are taken from actual_df.
+      3. Future dates with no actual use forward_rate.
+      4. Weekends and any other gaps are forward-filled from the last known
+         rate (e.g. March 1 Sun inherits the Feb 27 Fri fixing).
+      5. If the very first day of the month has no rate (month starts on a
+         weekend before any fixing exists), seed it from the last actual
+         available BEFORE the month start.
+      6. sr1_rate = mean of all calendar-day rates.
+
+    The "series" returned contains one row per calendar day so that the
+    running_avg and chart reflect the true daily rate sequence.
+    """
+    start     = date(year, month, 1)
+    last_day  = date(year, month, calendar.monthrange(year, month)[1])
+    end_excl  = last_day + timedelta(days=1)
+
+    # Build lookup: known actuals
+    lookup = actual_df.set_index("date")["rate"].to_dict()
+
+    # Step 5 — seed value for forward-fill if month starts with no actual
+    pre_actuals = actual_df[actual_df["date"] < start]
+    seed_rate   = pre_actuals.iloc[-1]["rate"] if not pre_actuals.empty else None
+
+    # Step 1-4 — iterate every calendar day
+    rows        = []
+    last_known  = seed_rate   # carries forward-filled rate
+    d           = start
+    while d < end_excl:
+        if d in lookup:
+            rate       = lookup[d]
+            src        = "actual"
+            last_known = rate
+        elif last_known is not None:
+            # forward-fill: weekend / future day inherits previous rate
+            rate = last_known
+            src  = "forward_fill" if d.weekday() >= 5 else "forward"
+        else:
+            # no prior rate at all — use forward_rate parameter
+            rate       = forward_rate
+            src        = "forward"
+            last_known = rate
+        rows.append({"date": d, "rate": rate, "source": src, "day_count": 1})
+        d += timedelta(days=1)
+
+    series = pd.DataFrame(rows)
     series["running_avg"] = series["rate"].expanding().mean()
     sr1_rate = series["rate"].mean()
     return {"rate": sr1_rate, "price": 100.0 - sr1_rate, "series": series}
@@ -95,7 +183,12 @@ def compute_sr1(year: int, month: int,
 
 def compute_sr3(start_year: int, start_month: int,
                 actual_df: pd.DataFrame, forward_rate: float) -> dict:
-    """Unchanged structure. Rounding applied externally via apply_rounding()."""
+    """
+    SR3: compounded SOFR over the 3-month period (3rd Wed → 3rd Tue+3M).
+    factor = 1 + (rate/100) * (day_count/360)  where day_count=3 for Friday.
+    This correctly accounts for weekend carry in the compounding.
+    Structure UNCHANGED.
+    """
     period_start = get_third_wednesday(start_year, start_month)
     em = start_month + 3
     ey = start_year + (em - 1) // 12
@@ -104,6 +197,7 @@ def compute_sr3(start_year: int, start_month: int,
     total_days = (period_end - period_start).days + 1
     series = build_rate_series(period_start, period_end + timedelta(days=1),
                                actual_df, forward_rate)
+    # factor = 1 + (rate/100) * (day_count/360)  — day_count=3 for Friday
     series["factor"]         = 1.0 + (series["rate"] / 100.0) * (series["day_count"] / 360.0)
     series["compound_index"] = series["factor"].cumprod()
     sr3_rate = (series["compound_index"].iloc[-1] - 1.0) * (360.0 / total_days) * 100.0
@@ -189,8 +283,8 @@ def load_excel() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # TABLE BUILDER
-# Date | Day | Days | Actual SOFR | GC Repo | ICAP | Case1–5 | Notes
-# Past-month mode: Date | Day | Days | Actual SOFR  only
+# Columns: Date | Day | Days | Actual SOFR | GC Repo | ICAP | Case1-5 | Notes
+# Only business days (Mon-Fri). Days = calendar gap to next business day.
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def build_table(start: date, end_excl: date,
@@ -199,8 +293,11 @@ def build_table(start: date, end_excl: date,
     act_lk  = actual_df.set_index("date")["rate"].to_dict()
     icap_lk = icap_df.set_index("date")["icap"].to_dict() if not icap_df.empty else {}
     gc_lk   = gc_df.set_index("date")["gc"].to_dict()     if not gc_df.empty   else {}
+    bds  = business_days(start, end_excl)
     rows = []
-    for d in business_days(start, end_excl):
+    for i, d in enumerate(bds):
+        next_bd  = bds[i + 1] if i + 1 < len(bds) else None
+        dc       = calendar_gap_day_count(d, next_bd)
         iso      = d.isoformat()
         act_val  = act_lk.get(d)
         locked   = (d <= YESTERDAY)
@@ -208,17 +305,18 @@ def build_table(start: date, end_excl: date,
         row = {
             "Date":        d,
             "Day":         d.strftime("%a"),
-            "Days":        day_count_for(d),
+            "Days":        dc,   # calendar gap to next business day
             "Actual SOFR": act_val,
             "GC Repo":     gc_lk.get(d),
             "ICAP":        icap_lk.get(d),
-            "_today":      is_today,   # internal marker, hidden in display
+            "_locked":     locked,
+            "_today":      is_today,
         }
         for c in CASES:
             if act_val is not None:
-                row[c] = act_val      # pre-fill with actual
+                row[c] = act_val              # pre-fill with actual
             elif locked:
-                row[c] = None         # past, no actual → blank & locked
+                row[c] = None                 # past, no actual -> blank & locked
             else:
                 row[c] = state[contract][c].get(iso)
         row["Notes"] = state["notes"][contract].get(iso, "")
@@ -248,10 +346,13 @@ def icap_as_df(start: date, end_excl: date,
                actual_df: pd.DataFrame, icap_df: pd.DataFrame) -> pd.DataFrame:
     act_lk  = actual_df.set_index("date")["rate"].to_dict()
     icap_lk = icap_df.set_index("date")["icap"].to_dict() if not icap_df.empty else {}
+    bds  = business_days(start, end_excl)
     rows = []
-    for d in business_days(start, end_excl):
+    for i, d in enumerate(bds):
+        next_bd = bds[i + 1] if i + 1 < len(bds) else None
+        dc      = calendar_gap_day_count(d, next_bd)
         r = act_lk.get(d, icap_lk.get(d))
-        rows.append({"date": d, "rate": r, "day_count": day_count_for(d)})
+        rows.append({"date": d, "rate": r, "day_count": dc})
     return pd.DataFrame(rows).dropna(subset=["rate"])
 
 
@@ -638,14 +739,22 @@ def fwd_banner(price, rate, fwd):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# EDITABLE TABLE RENDERER
-# Splits table: past rows displayed as static df (disabled), future as editable
+# SINGLE TABLE RENDERER
+#
+# ONE unified data_editor. Locking rules:
+#   - Date <= YESTERDAY  →  ALL case columns + Notes disabled (locked)
+#   - Date > YESTERDAY   →  Case columns editable, Notes editable
+#   - Actual SOFR, GC Repo, ICAP, Date, Day, Days are always disabled
+#
+# Weekend handling: build_table() only generates business days.
+# Friday rows have Days=3, representing Fri+Sat+Sun carry.
+# No Saturday/Sunday rows are ever created or displayed.
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def render_table(contract: str, start: date, end_excl: date, key: str) -> pd.DataFrame:
     scaffold = build_table(start, end_excl, actual_df, icap_df, gc_df, state, contract)
 
-    # Today highlight: inject via styled static display
+    # Today highlight
     today_mask = scaffold["_today"]
     if today_mask.any():
         today_date = scaffold.loc[today_mask, "Date"].iloc[0]
@@ -653,82 +762,101 @@ def render_table(contract: str, start: date, end_excl: date, key: str) -> pd.Dat
             f'Today in period: <span class="today-badge">📅 {today_date} ({today_date.strftime("%a")})</span>',
             unsafe_allow_html=True)
 
-    # Drop internal marker before showing
-    display_df = scaffold.drop(columns=["_today"])
+    # Drop internal marker columns before rendering
+    display_df = scaffold.drop(columns=["_locked", "_today"])
 
-    # Build column config — Case columns disabled for past rows via scaffold values
-    col_cfg = {
-        "Date":        st.column_config.DateColumn("Date",           disabled=True),
-        "Day":         st.column_config.TextColumn("Day",            disabled=True, width="small"),
-        "Days":        st.column_config.NumberColumn("Days",         disabled=True, width="small"),
-        "Actual SOFR": st.column_config.NumberColumn("Actual (%)",   disabled=True, format="%.5f"),
-        "GC Repo":     st.column_config.NumberColumn("GC Repo (%)",  disabled=True, format="%.5f"),
-        "ICAP":        st.column_config.NumberColumn("ICAP (%)",     disabled=True, format="%.5f"),
-        "Notes":       st.column_config.TextColumn("Notes"),
+    # ── Column configuration ──────────────────────────────────────────────────
+    # Static (always disabled) columns
+    base_cfg = {
+        "Date":        st.column_config.DateColumn("Date",          disabled=True),
+        "Day":         st.column_config.TextColumn("Day",           disabled=True, width="small"),
+        "Days":        st.column_config.NumberColumn("Days",        disabled=True, width="small"),
+        "Actual SOFR": st.column_config.NumberColumn("Actual (%)",  disabled=True, format="%.5f"),
+        "GC Repo":     st.column_config.NumberColumn("GC Repo (%)", disabled=True, format="%.5f"),
+        "ICAP":        st.column_config.NumberColumn("ICAP (%)",    disabled=True, format="%.5f"),
     }
-    # Past rows: Cases pre-filled as None (locked by not being editable in future)
-    # Future rows: Cases editable. We split into two separate displays.
-    past_df   = display_df[display_df["Date"].apply(
-        lambda d: (d if isinstance(d, date) else d.date()) <= YESTERDAY)]
-    future_df = display_df[display_df["Date"].apply(
-        lambda d: (d if isinstance(d, date) else d.date()) > YESTERDAY)]
 
-    # Past section — completely disabled data_editor
-    if not past_df.empty:
-        past_cfg = {k: v for k, v in col_cfg.items()}
+    # Determine which rows are locked (past) vs editable (future/today)
+    # We use scaffold's _locked column for this logic
+    locked_dates = set(
+        scaffold.loc[scaffold["_locked"], "Date"].apply(
+            lambda d: d if isinstance(d, date) else d.date()
+        ).tolist()
+    )
+    future_dates = set(
+        scaffold.loc[~scaffold["_locked"], "Date"].apply(
+            lambda d: d if isinstance(d, date) else d.date()
+        ).tolist()
+    )
+
+    # If ALL rows are locked (e.g. mid-past-month partial view), disable everything
+    all_locked = len(future_dates) == 0
+
+    col_cfg = dict(base_cfg)
+    if all_locked:
+        # Fully disable case columns and notes
         for c in CASES:
-            past_cfg[c] = st.column_config.NumberColumn(c, disabled=True, format="%.4f")
-        past_cfg["Notes"] = st.column_config.TextColumn("Notes", disabled=True)
-        # Highlight today row via background trick — apply color to Date column display
-        st.data_editor(past_df, column_config=past_cfg,
-                       use_container_width=True, hide_index=True,
-                       key=f"{key}_past", num_rows="fixed")
-
-    # Future section — editable cases
-    edited_future = future_df.copy()
-    if not future_df.empty:
-        fut_cfg = {k: v for k, v in col_cfg.items()}
+            col_cfg[c] = st.column_config.NumberColumn(c, disabled=True, format="%.4f")
+        col_cfg["Notes"] = st.column_config.TextColumn("Notes", disabled=True)
+    else:
+        # Future case columns are editable; past rows will have their values
+        # preserved from actual/state and won't be saved back even if touched
         for c in CASES:
-            fut_cfg[c] = st.column_config.NumberColumn(c, format="%.4f",
-                                                        min_value=0.0, max_value=20.0)
-        edited_future = st.data_editor(
-            future_df, column_config=fut_cfg,
-            use_container_width=True, hide_index=True,
-            key=f"{key}_future", num_rows="fixed")
+            col_cfg[c] = st.column_config.NumberColumn(
+                c, format="%.4f", min_value=0.0, max_value=20.0)
+        col_cfg["Notes"] = st.column_config.TextColumn("Notes")
 
-    # Merge past + edited future back
-    full_edited = pd.concat([past_df, edited_future], ignore_index=True)
-    full_edited = full_edited.sort_values("Date").reset_index(drop=True)
+    # ── Single data_editor ────────────────────────────────────────────────────
+    edited = st.data_editor(
+        display_df,
+        column_config=col_cfg,
+        use_container_width=True,
+        hide_index=True,
+        key=f"{key}_table",
+        num_rows="fixed",
+    )
 
     # Note badges
-    note_mask = full_edited["Notes"].notna() & (full_edited["Notes"].str.strip() != "")
+    note_mask = edited["Notes"].notna() & (edited["Notes"].str.strip() != "")
     if note_mask.any():
         badges = " ".join(
             f'<span class="note-badge">{r["Day"]} {r["Date"]}</span>'
-            for _, r in full_edited[note_mask].iterrows())
+            for _, r in edited[note_mask].iterrows())
         st.markdown(f"🟡 Notes on: {badges}", unsafe_allow_html=True)
 
-    # Persist — future, non-actual only
+    # ── Persist — future & non-actual rows ONLY ───────────────────────────────
+    # Past rows (date <= YESTERDAY) are NEVER written back to state,
+    # regardless of what the editor returns for those rows.
     changed = False
-    for _, row in full_edited.iterrows():
+    for _, row in edited.iterrows():
         d = row["Date"]
         if isinstance(d, pd.Timestamp): d = d.date()
         iso = d.isoformat()
+
         if d > YESTERDAY and d not in actual_dates:
+            # Editable future row — persist case values
             for c in CASES:
                 val = row[c]
                 if pd.notna(val):
                     if state[contract][c].get(iso) != float(val):
                         state[contract][c][iso] = float(val)
                         changed = True
-        note = (row["Notes"] or "").strip()
-        if state["notes"][contract].get(iso, "") != note:
-            state["notes"][contract][iso] = note
-            changed = True
+            # Persist notes for future rows
+            note = (row["Notes"] or "").strip()
+            if state["notes"][contract].get(iso, "") != note:
+                state["notes"][contract][iso] = note
+                changed = True
+        elif d <= YESTERDAY:
+            # Past row — only persist notes (case values locked / not editable)
+            note = (row["Notes"] or "").strip()
+            if state["notes"][contract].get(iso, "") != note:
+                state["notes"][contract][iso] = note
+                changed = True
+
     if changed:
         save_state(state)
 
-    return full_edited
+    return edited
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -738,10 +866,13 @@ def render_table(contract: str, start: date, end_excl: date, key: str) -> pd.Dat
 def render_past_month(contract_label: str, start: date, end_excl: date,
                       compute_fn, rounding_contract: str):
     act_lk = actual_df.set_index("date")["rate"].to_dict()
+    bds  = business_days(start, end_excl)
     rows = []
-    for d in business_days(start, end_excl):
+    for i, d in enumerate(bds):
+        next_bd = bds[i + 1] if i + 1 < len(bds) else None
+        dc      = calendar_gap_day_count(d, next_bd)
         rows.append({"Date": d, "Day": d.strftime("%a"),
-                     "Days": day_count_for(d),
+                     "Days": dc,
                      "Actual SOFR": act_lk.get(d)})
     df = pd.DataFrame(rows)
     st.dataframe(df, use_container_width=True, hide_index=True)
@@ -800,7 +931,7 @@ with tab_sr1:
 
         edited_sr1 = render_table("sr1", sr1_start, sr1_end_excl,
                                   f"tbl_sr1_{sel_year}_{sel_month}")
-        st.caption("🔒 Past rows locked · 🟡 Fri = 3-day accrual · Actual/GC/ICAP read-only")
+        st.caption("🔒 Past rows locked (date <= yesterday) · Days = calendar gap to next BD (weekend carry included) · Actual/GC/ICAP read-only")
 
         spr1 = icap_spread_table(edited_sr1)
         if spr1 is not None:
@@ -862,7 +993,7 @@ with tab_sr3:
 
         edited_sr3 = render_table("sr3", sr3_start, sr3_end_excl,
                                   f"tbl_sr3_{sel_year}_{sel_month}")
-        st.caption("🔒 Past rows locked · 🟡 Fri = 3-day accrual · factor = 1+(r/100)×(dc/360)")
+        st.caption("🔒 Past rows locked (date <= yesterday) · Days = calendar gap to next BD · factor = 1+(r/100)*(day_count/360)")
 
         spr3 = icap_spread_table(edited_sr3)
         if spr3 is not None:
@@ -973,11 +1104,14 @@ with tab_pnl:
 | DV01/lot | ${DV01_SR1:.0f}/bp | ${DV01_SR3:.0f}/bp |
 | Price | 100 − avg(SOFR) | 100 − compounded annualised SOFR |
 | Rounding | 3 dp (half-up) | 4 dp (half-up) |
-| Day count | 1 all biz days | 1 Mon–Thu, **3 Fri** |
+| Day count | (next_BD - cur_BD).days — gap absorbs weekends/holidays | same |
+| Weekend rows | Never displayed — preceding BD carries all gap days | same |
+| Locking | Date ≤ yesterday: all case cols locked | same |
 | TC | ${TC_PER_LOT:.0f} round-turn/lot | same |
 | SOFR chart y | {SOFR_Y_MIN}–{SOFR_Y_MAX}% fixed | — |
 
 **Gross PnL** = (Price − Entry) × 100 bps × DV01 × Lots  
 **Net PnL**   = Gross − (Lots × TC)  
+**Weekend carry**: each BD uses day_count=(next_BD-cur_BD).days, so any calendar gap (weekends, holidays, month-start Sundays) is absorbed by the preceding business day  
 **State:** `{STATE_PATH}`
 """)
