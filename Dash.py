@@ -24,8 +24,12 @@ import altair as alt
 # ═══════════════════════════════════════════════════════════════════════════════
 
 BASE_DIR    = os.path.dirname(os.path.abspath(__file__))
-EXCEL_PATH  = os.path.join(BASE_DIR, "sofr_data.xlsx")
 STATE_PATH  = os.path.join(BASE_DIR, "sofr_state.json")
+
+GSHEET_CSV_URL = (
+    "https://docs.google.com/spreadsheets/d/"
+    "1hNLXTFHkT42UI6grUxvyKbB1VFZwJy4OeGKxHntkWxQ/export?format=csv"
+)
 
 CASES       = ["Case1", "Case2", "Case3", "Case4", "Case5"]
 ALL_COLS    = ["ICAP"] + CASES
@@ -256,28 +260,39 @@ def save_state(st_obj: dict):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# EXCEL LOADER  — date | sofr | icap | gc  (icap, gc optional)
+# GOOGLE SHEETS LOADER  — date | sofr | icap | gc  (icap, gc optional)
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def load_excel() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+@st.cache_data(ttl=0)
+def load_gsheet() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     empty_a = pd.DataFrame(columns=["date", "rate"])
     empty_i = pd.DataFrame(columns=["date", "icap"])
     empty_g = pd.DataFrame(columns=["date", "gc"])
-    if not os.path.exists(EXCEL_PATH):
+    try:
+        raw = pd.read_csv(GSHEET_CSV_URL)
+    except Exception as e:
+        st.error(f"Failed to load Google Sheet: {e}")
         return empty_a, empty_i, empty_g
-    raw = pd.read_excel(EXCEL_PATH)
     raw.columns = [c.strip().lower() for c in raw.columns]
-    raw["date"] = pd.to_datetime(raw[raw.columns[0]]).dt.date
+    raw["date"] = pd.to_datetime(raw[raw.columns[0]], dayfirst=False, errors="coerce").dt.date
+    raw = raw.dropna(subset=["date"]).sort_values("date").reset_index(drop=True)
     sofr_col = "sofr" if "sofr" in raw.columns else raw.columns[1]
+    raw[sofr_col] = pd.to_numeric(raw[sofr_col], errors="coerce")
     actual = (raw[["date", sofr_col]].rename(columns={sofr_col: "rate"})
               .dropna(subset=["rate"]).drop_duplicates("date")
               .sort_values("date").reset_index(drop=True))
-    icap = (raw[["date", "icap"]].dropna(subset=["icap"]).drop_duplicates("date")
-            .sort_values("date").reset_index(drop=True)
-            if "icap" in raw.columns else empty_i)
-    gc   = (raw[["date", "gc"]].dropna(subset=["gc"]).drop_duplicates("date")
-            .sort_values("date").reset_index(drop=True)
-            if "gc" in raw.columns else empty_g)
+    if "icap" in raw.columns:
+        raw["icap"] = pd.to_numeric(raw["icap"], errors="coerce")
+        icap = (raw[["date", "icap"]].dropna(subset=["icap"]).drop_duplicates("date")
+                .sort_values("date").reset_index(drop=True))
+    else:
+        icap = empty_i
+    if "gc" in raw.columns:
+        raw["gc"] = pd.to_numeric(raw["gc"], errors="coerce")
+        gc = (raw[["date", "gc"]].dropna(subset=["gc"]).drop_duplicates("date")
+              .sort_values("date").reset_index(drop=True))
+    else:
+        gc = empty_g
     return actual, icap, gc
 
 
@@ -294,6 +309,14 @@ def build_table(start: date, end_excl: date,
     icap_lk = icap_df.set_index("date")["icap"].to_dict() if not icap_df.empty else {}
     gc_lk   = gc_df.set_index("date")["gc"].to_dict()     if not gc_df.empty   else {}
     bds  = business_days(start, end_excl)
+
+    # Determine previous business day's SOFR for today fallback
+    prev_sofr = None
+    if not actual_df.empty:
+        past = actual_df[actual_df["date"] < TODAY]
+        if not past.empty:
+            prev_sofr = past.iloc[-1]["rate"]
+
     rows = []
     for i, d in enumerate(bds):
         next_bd  = bds[i + 1] if i + 1 < len(bds) else None
@@ -305,7 +328,7 @@ def build_table(start: date, end_excl: date,
         row = {
             "Date":        d,
             "Day":         d.strftime("%a"),
-            "Days":        dc,   # calendar gap to next business day
+            "Days":        dc,
             "Actual SOFR": act_val,
             "GC Repo":     gc_lk.get(d),
             "ICAP":        icap_lk.get(d),
@@ -314,9 +337,20 @@ def build_table(start: date, end_excl: date,
         }
         for c in CASES:
             if act_val is not None:
-                row[c] = act_val              # pre-fill with actual
+                row[c] = act_val              # actual fixing available — use it
             elif locked:
                 row[c] = None                 # past, no actual -> blank & locked
+            elif is_today:
+                # Today: prefill with best available value (priority order)
+                saved = state[contract][c].get(iso)
+                if saved is not None:
+                    row[c] = saved            # user has already edited this
+                elif icap_lk.get(d) is not None:
+                    row[c] = icap_lk[d]       # ICAP available
+                elif prev_sofr is not None:
+                    row[c] = prev_sofr         # previous BD's SOFR
+                else:
+                    row[c] = None
             else:
                 row[c] = state[contract][c].get(iso)
         row["Notes"] = state["notes"][contract].get(iso, "")
@@ -517,29 +551,6 @@ def past_month_actual_chart(actual_df: pd.DataFrame,
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# ICAP SPREAD TABLE
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def icap_spread_table(table: pd.DataFrame) -> pd.DataFrame | None:
-    if icap_df.empty:
-        return None
-    lk = icap_df.set_index("date")["icap"].to_dict()
-    rows = []
-    for _, row in table.iterrows():
-        d = row["Date"]
-        if isinstance(d, pd.Timestamp): d = d.date()
-        iv = lk.get(d)
-        if iv is None:
-            continue
-        r = {"Date": d, "Day": row["Day"], "ICAP (%)": round(iv, 5)}
-        for c in CASES:
-            cv = row[c]
-            r[f"{c}−ICAP"] = round((cv - iv) * 100, 2) if pd.notna(cv) else None
-        rows.append(r)
-    return pd.DataFrame(rows) if rows else None
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
 # PAGE CONFIG & DARK CSS
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -626,7 +637,7 @@ if "state" not in st.session_state:
     st.session_state.state = load_state()
 state = st.session_state.state
 
-actual_df, icap_df, gc_df = load_excel()
+actual_df, icap_df, gc_df = load_gsheet()
 actual_dates = set(actual_df["date"].tolist())
 has_icap     = not icap_df.empty
 has_gc       = not gc_df.empty
@@ -636,7 +647,7 @@ file_status = (
     + (f" · **{len(icap_df)}** ICAP" if has_icap else "")
     + (f" · **{len(gc_df)}** GC"     if has_gc   else "")
     + " rows loaded"
-    if len(actual_df) else "⚠️ `sofr_data.xlsx` not found"
+    if len(actual_df) else "⚠️ Google Sheet returned no data"
 )
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -646,12 +657,6 @@ file_status = (
 with st.sidebar:
     st.markdown("### 📂 Data")
     st.markdown(file_status)
-    if st.button("🔄 Reload Excel"):
-        actual_df, icap_df, gc_df = load_excel()
-        actual_dates = set(actual_df["date"].tolist())
-        has_icap = not icap_df.empty
-        has_gc   = not gc_df.empty
-        st.success("Reloaded.")
 
     st.markdown("---")
     st.markdown("### 🗓 Contract Month")
@@ -659,12 +664,6 @@ with st.sidebar:
     sel_year  = st.number_input("Year",  min_value=2020, max_value=2040, value=today_ref.year)
     sel_month = st.selectbox("Month", list(range(1, 13)), index=today_ref.month - 1,
                              format_func=lambda m: calendar.month_name[m])
-
-    st.markdown("---")
-    st.markdown("### 📐 Forward Avg Estimator")
-    fwd_avg = st.number_input("Avg SOFR for remaining days (%)", value=3.64,
-                               step=0.01, format="%.2f",
-                               help="Applied to unfilled future days for estimated fixing & price")
 
     st.markdown("---")
     st.markdown("### ⚡ Fast Fill")
@@ -700,11 +699,11 @@ with st.sidebar:
         st.success(f"Shifted {sh_case} by {sh_bps:+.1f} bps.")
 
     st.markdown("---")
-    st.markdown("### 📊 Position")
-    sr1_lots  = st.number_input("SR1 Lots",        value=1,    step=1)
-    sr3_lots  = st.number_input("SR3 Lots",        value=1,     step=1)
-    sr1_entry = st.number_input("SR1 Entry Price", value=96.36, step=0.0025, format="%.4f")
-    sr3_entry = st.number_input("SR3 Entry Price", value=96.36, step=0.0025, format="%.4f")
+    st.markdown("### 🗑 Clear State")
+    if st.button("🗑 Clear saved state"):
+        st.session_state.state = load_state.__wrapped__() if hasattr(load_state, '__wrapped__') else load_state()
+        save_state(st.session_state.state)
+        st.success("State cleared.")
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # CONTRACT WINDOWS
@@ -722,6 +721,9 @@ sr3_cal_days = (sr3_end_incl - sr3_start).days + 1
 # Fully-past month flag: last day of month < today
 sr1_is_past = (sr1_end_excl - timedelta(days=1)) < TODAY
 sr3_is_past = sr3_end_incl < TODAY
+
+# Forward avg default (sidebar estimator removed; kept for internal calc compatibility)
+fwd_avg = 0.0
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # UI HELPERS
@@ -937,8 +939,8 @@ st.markdown(
     'One-Month &amp; Three-Month SOFR Futures — Multi-Case Trading Desk</p>',
     unsafe_allow_html=True)
 
-tab_sr1, tab_sr3, tab_pnl = st.tabs(
-    ["📅 SR1 — One Month", "📆 SR3 — Three Month", "💰 PnL & Summary"])
+tab_sr1, tab_sr3 = st.tabs(
+    ["📅 SR1 — One Month", "📆 SR3 — Three Month"])
 
 # ╔══════════════════════════════════════════════════════════════════════════════
 # SR1 TAB
@@ -966,18 +968,11 @@ with tab_sr1:
                                   f"tbl_sr1_{sel_year}_{sel_month}")
         st.caption("🔒 Past rows locked (date <= yesterday) · Days = calendar gap to next BD (weekend carry included) · Actual/GC/ICAP read-only")
 
-        spr1 = icap_spread_table(edited_sr1)
-        if spr1 is not None:
-            with st.expander("📊 Case − ICAP Spread (bps)"):
-                st.dataframe(spr1, use_container_width=True, hide_index=True)
-
         icap_adf = icap_as_df(sr1_start, sr1_end_excl, actual_df, icap_df)
         final_sr1 = resolve_final(edited_sr1, actual_df)
         sr1_res   = compute_all_sr1(final_sr1, icap_adf)
 
-        fwd_r1 = fwd_avg_result_sr1(fwd_avg)
         section("SR1 Prices & Rates")
-        fwd_banner(fwd_r1["price"], fwd_r1["rate"], fwd_avg)
 
         cards = st.columns(6)
         for i, col_key in enumerate(ALL_COLS):
@@ -1028,18 +1023,11 @@ with tab_sr3:
                                   f"tbl_sr3_{sel_year}_{sel_month}")
         st.caption("🔒 Past rows locked (date <= yesterday) · Days = calendar gap to next BD · factor = 1+(r/100)*(day_count/360)")
 
-        spr3 = icap_spread_table(edited_sr3)
-        if spr3 is not None:
-            with st.expander("📊 Case − ICAP Spread (bps)"):
-                st.dataframe(spr3, use_container_width=True, hide_index=True)
-
         icap_adf = icap_as_df(sr3_start, sr3_end_excl, actual_df, icap_df)
         final_sr3 = resolve_final(edited_sr3, actual_df)
         sr3_res   = compute_all_sr3(final_sr3, icap_adf)
 
-        fwd_r3 = fwd_avg_result_sr3(fwd_avg)
         section("SR3 Prices & Rates")
-        fwd_banner(fwd_r3["price"], fwd_r3["rate"], fwd_avg)
 
         cards = st.columns(6)
         for i, col_key in enumerate(ALL_COLS):
@@ -1064,87 +1052,3 @@ with tab_sr3:
             gc_ch = gc_chart(gc_df, actual_df)
             if gc_ch:
                 st.altair_chart(gc_ch, use_container_width=True)
-
-# ╔══════════════════════════════════════════════════════════════════════════════
-# PNL TAB
-# ╚══════════════════════════════════════════════════════════════════════════════
-with tab_pnl:
-    section("PnL — All Cases · Gross / Net (after TC)")
-
-    def fmt(v): return f"{v:+,.0f}" if not np.isnan(v) else "—"
-
-    summary_rows = []
-    for col_key in ALL_COLS:
-        r1  = sr1_res.get(col_key) if sr1_res else None
-        r3  = sr3_res.get(col_key) if sr3_res else None
-        g1  = compute_pnl(r1["price"], sr1_entry, sr1_lots, DV01_SR1) if r1 else np.nan
-        g3  = compute_pnl(r3["price"], sr3_entry, sr3_lots, DV01_SR3) if r3 else np.nan
-        tc1 = sr1_lots * TC_PER_LOT
-        tc3 = sr3_lots * TC_PER_LOT
-        n1  = g1 - tc1 if not np.isnan(g1) else np.nan
-        n3  = g3 - tc3 if not np.isnan(g3) else np.nan
-        gt  = g1 + g3  if not (np.isnan(g1) or np.isnan(g3)) else np.nan
-        nt  = n1 + n3  if not (np.isnan(n1) or np.isnan(n3)) else np.nan
-        summary_rows.append({
-            "":              col_key,
-            "SR1 Price":     f"{r1['price']:.4f}"  if r1 else "—",
-            "SR1 Rate":      f"{r1['rate']:.5f}%"  if r1 else "—",
-            "SR3 Price":     f"{r3['price']:.4f}"  if r3 else "—",
-            "SR3 Rate":      f"{r3['rate']:.5f}%"  if r3 else "—",
-            "SR1 Gross $":   fmt(g1),
-            "SR3 Gross $":   fmt(g3),
-            "Total Gross $": fmt(gt),
-            "TC $":          f"−{tc1+tc3:.0f}",
-            "Net PnL $":     fmt(nt),
-        })
-    st.dataframe(pd.DataFrame(summary_rows), use_container_width=True, hide_index=True)
-
-    section("PnL Cards")
-    cards = st.columns(6)
-    for i, col_key in enumerate(ALL_COLS):
-        r1 = sr1_res.get(col_key) if sr1_res else None
-        r3 = sr3_res.get(col_key) if sr3_res else None
-        with cards[i]:
-            if r1:
-                g1  = compute_pnl(r1["price"], sr1_entry, sr1_lots, DV01_SR1)
-                tc1 = sr1_lots * TC_PER_LOT
-                st.markdown(pnl_card_html(f"{col_key} SR1", g1, g1 - tc1, tc1,
-                                          sr1_entry, r1["price"]), unsafe_allow_html=True)
-            if r3:
-                g3  = compute_pnl(r3["price"], sr3_entry, sr3_lots, DV01_SR3)
-                tc3 = sr3_lots * TC_PER_LOT
-                st.markdown(pnl_card_html(f"{col_key} SR3", g3, g3 - tc3, tc3,
-                                          sr3_entry, r3["price"]), unsafe_allow_html=True)
-            if r1 and r3:
-                g1  = compute_pnl(r1["price"], sr1_entry, sr1_lots, DV01_SR1)
-                g3  = compute_pnl(r3["price"], sr3_entry, sr3_lots, DV01_SR3)
-                tc  = (sr1_lots + sr3_lots) * TC_PER_LOT
-                net = g1 + g3 - tc
-                cls = "pnl-pos" if net >= 0 else "pnl-neg"
-                sgn = "+" if net >= 0 else ""
-                st.markdown(
-                    f'<div class="metric-card hl">'
-                    f'<div class="metric-label">{col_key} Total</div>'
-                    f'<div class="metric-price {cls}">{sgn}${net:,.0f}</div>'
-                    f'<div class="metric-rate">Gross {g1+g3:+,.0f} · TC −${tc:.0f}</div>'
-                    f'</div>',
-                    unsafe_allow_html=True)
-
-    with st.expander("ℹ️  Assumptions"):
-        st.markdown(f"""
-| | SR1 | SR3 |
-|---|---|---|
-| DV01/lot | ${DV01_SR1:.0f}/bp | ${DV01_SR3:.0f}/bp |
-| Price | 100 − avg(SOFR) | 100 − compounded annualised SOFR |
-| Rounding | 3 dp (half-up) | 4 dp (half-up) |
-| Day count | (next_BD - cur_BD).days — gap absorbs weekends/holidays | same |
-| Weekend rows | Never displayed — preceding BD carries all gap days | same |
-| Locking | Date ≤ yesterday: all case cols locked | same |
-| TC | ${TC_PER_LOT:.0f} round-turn/lot | same |
-| SOFR chart y | {SOFR_Y_MIN}–{SOFR_Y_MAX}% fixed | — |
-
-**Gross PnL** = (Price − Entry) × 100 bps × DV01 × Lots  
-**Net PnL**   = Gross − (Lots × TC)  
-**Weekend carry**: each BD uses day_count=(next_BD-cur_BD).days, so any calendar gap (weekends, holidays, month-start Sundays) is absorbed by the preceding business day  
-**State:** `{STATE_PATH}`
-""")
